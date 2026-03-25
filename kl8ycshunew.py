@@ -17,38 +17,41 @@
 作者：基于您所有代码的终极整合
 日期：2026-03-19
 """
+# 程序总流程（向下翻看即可）：抓取推荐页+开奖API → 分析“用多少期回测最稳” → 多套权重回测选最优
+# → 对最近15期+最新期做预测 → 拼 HTML 邮件并发信/落盘。定时入口 main() → run_scheduler() 常驻轮询。
 
-import requests
-from bs4 import BeautifulSoup
-import re
-import json
-from collections import Counter, defaultdict
-from datetime import datetime
-from typing import Dict, List, Tuple, Set
-import random
-import zmail
-import schedule
-import time
-import sys
+import requests  # HTTP 请求：拉网页、拉 JSON 接口
+from bs4 import BeautifulSoup  # 把 HTML 解析成可查询的标签树
+import re  # 正则：从 HTML 片段里抠开奖号码、匹配 data-name
+import json  # 解析 API 返回的 JSON 文本
+from collections import Counter, defaultdict  # Counter 统计号码出现次数；defaultdict 备用
+from datetime import datetime  # 邮件标题、生成时间、JSON 里的时间戳
+from typing import Dict, List, Tuple, Set  # 类型注解，方便读代码与工具检查
+import random  # 若需随机性（主流程以确定性分析为主）
+import zmail  # SMTP 发邮件（HTML）
+import schedule  # 按日历时间注册后台任务
+import time  # sleep：定时循环里每隔一段时间检查是否到点
+import sys  # exit 退出进程
 
 
 # ==================== 配置部分 ====================
 
-KL8_HTML_URL = 'https://www.17500.cn/tool/kl8-allm.html'
+KL8_HTML_URL = 'https://www.17500.cn/tool/kl8-allm.html'  # 17500 快乐8「推荐+试机」等合一的网页
+# 以下为快乐8开奖列表 JSON（注意：URL 中无 {limit}，后面 format(limit) 实际不改变地址）
 KL8_API_URL = 'https://m.17500.cn/tgj/api/kl8/getTbList?action=zhfb&page=1&limit=100&orderby=asc&start_issue=0&end_issue=0&week=all'
 
-HEADERS = {
+HEADERS = {  # 模拟浏览器访问 HTML 页，降低被拒概率
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
 }
 
-API_HEADERS = {
+API_HEADERS = {  # 访问 JSON 接口用的头；Referer 模拟从列表页发起请求
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
     'Accept': 'application/json, text/javascript, */*; q=0.01',
     'Referer': 'https://m.17500.cn/tgj/kl8-kjfb.html'
 }
 
-EMAIL_CONFIG = {
+EMAIL_CONFIG = {  # 发件箱与收件人（password 一般为邮箱 SMTP 授权码，勿泄露）
     'sender': 'zhenglei1071925251@qq.com',
     'password': 'hcjxwdijbfxpbfha',
     'recipients': [
@@ -57,7 +60,7 @@ EMAIL_CONFIG = {
     ]
 }
 
-# 基础维度权重
+# 基础维度权重：各分析项在「给号码打分」时的相对重要性（后续回测会在此基础上微调）
 BASE_DIMENSIONS = {
     'hot_number': 30,
     'cold_number': 12,
@@ -78,20 +81,20 @@ BASE_DIMENSIONS = {
 # ==================== 第一部分：数据获取 ====================
 
 class DataFetcher:
-    """数据获取器"""
+    """数据获取器：负责 HTTP 拉取 + 解析成 Python 数据结构"""
     
     def __init__(self):
-        pass
+        pass  # 无状态，可不初始化成员
     
     def fetch_lottery_api_data(self, limit=100):
-        """从 API 获取开奖数据"""
+        """从 API 获取开奖数据（原始 JSON，需再 parse_api_data 规范化）"""
         try:
-            url = KL8_API_URL.format(limit=limit)
-            response = requests.get(url, headers=API_HEADERS, timeout=10)
-            response.raise_for_status()
-            data = json.loads(response.text)
+            url = KL8_API_URL.format(limit=limit)  # 当前 URL 无占位符，limit 未真正拼进链接
+            response = requests.get(url, headers=API_HEADERS, timeout=10)  # GET，10 秒超时
+            response.raise_for_status()  # 非 2xx 状态码则抛异常
+            data = json.loads(response.text)  # 响应体当 JSON 解析
             
-            if 'data' not in data or 'data' not in data['data']:
+            if 'data' not in data or 'data' not in data['data']:  # 与站点约定结构不符
                 raise ValueError("API 返回数据格式不正确")
             
             return data
@@ -100,24 +103,24 @@ class DataFetcher:
             return None
     
     def fetch_html_recommend_data(self, limit=30):
-        """从 HTML 页面获取推荐数据"""
+        """从 HTML 页面解析多期：期号、日期、已开奖号、五类推荐号"""
         try:
             response = requests.get(KL8_HTML_URL, headers=HEADERS, timeout=15)
-            response.encoding = 'utf-8'
+            response.encoding = 'utf-8'  # 显式 UTF-8，避免乱码
             
-            soup = BeautifulSoup(response.text, 'html.parser')
-            periods_data = {}
+            soup = BeautifulSoup(response.text, 'html.parser')  # 解析整页
+            periods_data = {}  # issue 字符串 → 该期字典
             
-            dd_tags = soup.find_all('dd', class_='flex lineb')
+            dd_tags = soup.find_all('dd', class_='flex lineb')  # 每期一块 dd
             
-            for dd in dd_tags:
+            for dd in dd_tags:  # 遍历页面上每一期
                 issue_elem = dd.find('p')
                 if not issue_elem:
                     continue
                 
-                issue = issue_elem.get_text(strip=True)
+                issue = issue_elem.get_text(strip=True)  # 期号文本，如「第 xxx 期」依页面而定
                 
-                if issue not in periods_data:
+                if issue not in periods_data:  # 首次见到该期则建空壳
                     periods_data[issue] = {
                         'issue': issue,
                         'lottery_numbers': [],
@@ -134,21 +137,21 @@ class DataFetcher:
                     periods_data[issue]['date'] = date_elem.get_text(strip=True)
                 
                 winnum_elem = dd.find('p', class_='ball', attrs={'data-name': re.compile(r'winnum_')})
-                if winnum_elem:
+                if winnum_elem:  # 已开奖则有 20 个红球
                     numbers = []
                     b_tags = winnum_elem.find_all('b')
-                    for b in b_tags:
+                    for b in b_tags:  # 每个 <b> 一个两位号
                         num_text = b.get_text(strip=True)
                         if num_text.isdigit():
                             numbers.append(int(num_text))
-                    periods_data[issue]['lottery_numbers'] = sorted(numbers)
+                    periods_data[issue]['lottery_numbers'] = sorted(numbers)  # 排序存储便于展示/比对
                 
-                data_elements = dd.find_all(attrs={'data-name': True, 'data-v': True})
-                for elem in data_elements:
+                data_elements = dd.find_all(attrs={'data-name': True, 'data-v': True})  # 带 data-v 的推荐项
+                for elem in data_elements:  # 根据 data-name / 标签文字归入五类推荐
                     data_name = elem.get('data-name', '')
                     data_value = elem.get('data-v', '')
                     
-                    numbers = [int(n) for n in data_value.split() if n.isdigit()]
+                    numbers = [int(n) for n in data_value.split() if n.isdigit()]  # data-v 里空格分隔的号码
                     
                     i_tag = elem.find('i')
                     i_text = i_tag.get_text(strip=True) if i_tag else ''
@@ -164,32 +167,32 @@ class DataFetcher:
                     elif 'duiyingma_' in data_name or i_text == '对':
                         periods_data[issue]['duiying'] = numbers
             
-            sorted_periods = sorted(periods_data.values(), key=lambda x: x['issue'], reverse=True)
-            return sorted_periods[:limit]
+            sorted_periods = sorted(periods_data.values(), key=lambda x: x['issue'], reverse=True)  # 期号大的在前（新→旧）
+            return sorted_periods[:limit]  # 只保留最近 limit 期
         
         except Exception as e:
             print(f"✗ HTML 推荐数据获取失败：{e}")
             return []
     
     def parse_api_data(self, api_data):
-        """解析 API 数据"""
+        """把开奖 API 的每条记录转成 historical_draws[期号]，并排序期号列表"""
         lottery_data = {
-            'current_draw': '',
-            'historical_draws': {},
-            'sorted_issues': []
+            'current_draw': '',  # 目前已见的最大期号（字符串）
+            'historical_draws': {},  # 期号 → {numbers, date, sum, ...}
+            'sorted_issues': []  # 升序期号列表，供按时间遍历
         }
         
-        pattern = r"<span class='fred'>(\d+)</span>"
+        pattern = r"<span class='fred'>(\d+)</span>"  # winnum 里是 HTML，用正则取数字
         
-        for item in api_data['data']['data']:
+        for item in api_data['data']['data']:  # 每条一期开奖
             issue = str(item['issue'])
             numbers_html = item['winnum']
             numbers = [int(m) for m in re.findall(pattern, numbers_html)]
             
-            if not numbers or len(numbers) != 20:
+            if not numbers or len(numbers) != 20:  # 快乐8 每期 20 个号，不完整则跳过
                 continue
             
-            zhfb = item.get('zhfb', {})
+            zhfb = item.get('zhfb', {})  # 和值、跨度等扩展字段
             
             lottery_data['historical_draws'][issue] = {
                 'numbers': sorted(numbers),
@@ -205,9 +208,9 @@ class DataFetcher:
             }
             
             if not lottery_data['current_draw'] or int(issue) > int(lottery_data['current_draw']):
-                lottery_data['current_draw'] = issue
+                lottery_data['current_draw'] = issue  # 维护「最新期号」
         
-        lottery_data['sorted_issues'] = sorted(lottery_data['historical_draws'].keys())
+        lottery_data['sorted_issues'] = sorted(lottery_data['historical_draws'].keys())  # 字符串期号按字典序排序（通常为数字序）
         
         return lottery_data
 
@@ -215,36 +218,36 @@ class DataFetcher:
 # ==================== 第二部分：周期性分析器 ====================
 
 class PeriodicityAnalyzer:
-    """周期性分析器"""
+    """周期性分析器：用「相邻期号码重复个数」的波动，选出回测窗口长度（几期更稳）"""
     
     def __init__(self, lottery_data: Dict):
-        self.lottery_data = lottery_data
-        self.sorted_issues = lottery_data['sorted_issues'] if lottery_data else []
+        self.lottery_data = lottery_data  # 含 historical_draws、sorted_issues
+        self.sorted_issues = lottery_data['sorted_issues'] if lottery_data else []  # 升序期号
     
     def analyze_optimal_backtest_periods(self) -> Dict:
-        """分析最优回测期数"""
+        """枚举多种回测长度，算稳定性 stability，返回最优期数 optimal_periods"""
         print("\n" + "=" * 80)
         print("【开始分析开奖数据周期性】")
         print("=" * 80)
         
-        test_ranges = [5, 7, 10, 12, 15, 20, 25, 30]
-        results = {}
+        test_ranges = [5, 7, 10, 12, 15, 20, 25, 30]  # 候选「连续期数」
+        results = {}  # period_count → {avg_hit_rate, std_dev, stability}
         
         for period_count in test_ranges:
-            if len(self.sorted_issues) < period_count:
+            if len(self.sorted_issues) < period_count:  # 数据不够长则跳过该候选
                 continue
             
-            hit_rates = []
+            hit_rates = []  # 每个滑动窗口得到一个「平均相邻重复数」
             
-            for start_idx in range(len(self.sorted_issues) - period_count):
+            for start_idx in range(len(self.sorted_issues) - period_count):  # 滑动窗口
                 end_idx = start_idx + period_count
                 test_issues = self.sorted_issues[start_idx:end_idx]
                 
                 repeat_counts = []
-                for i in range(1, len(test_issues)):
+                for i in range(1, len(test_issues)):  # 窗口内相邻两期
                     prev_nums = set(self.lottery_data['historical_draws'][test_issues[i-1]]['numbers'])
                     curr_nums = set(self.lottery_data['historical_draws'][test_issues[i]]['numbers'])
-                    repeat_counts.append(len(prev_nums & curr_nums))
+                    repeat_counts.append(len(prev_nums & curr_nums))  # 两期交集个数（重号数）
                 
                 if repeat_counts:
                     avg_repeat = sum(repeat_counts) / len(repeat_counts)
@@ -253,14 +256,14 @@ class PeriodicityAnalyzer:
             if hit_rates:
                 avg_hit_rate = sum(hit_rates) / len(hit_rates)
                 std_dev = (sum((x - avg_hit_rate) ** 2 for x in hit_rates) / len(hit_rates)) ** 0.5
-                stability = 1 - (std_dev / avg_hit_rate if avg_hit_rate > 0 else 1)
+                stability = 1 - (std_dev / avg_hit_rate if avg_hit_rate > 0 else 1)  # 相对波动越小越「稳」
                 results[period_count] = {
                     'avg_hit_rate': avg_hit_rate,
                     'std_dev': std_dev,
                     'stability': stability
                 }
         
-        best_period = max(results.items(), key=lambda x: x[1]['stability'])
+        best_period = max(results.items(), key=lambda x: x[1]['stability'])  # 挑 stability 最大的窗口长度
         
         print(f"\n各期数范围稳定性分析:")
         for period, stats in sorted(results.items()):
@@ -278,18 +281,18 @@ class PeriodicityAnalyzer:
 # ==================== 第三部分：多维度分析引擎 ====================
 
 class MultiDimensionAnalyzer:
-    """多维度分析器"""
+    """多维度分析器：为 1～80 每个号预计算冷热遗漏等，再按权重合成「综合分」"""
     
     def __init__(self, lottery_data: Dict, dimension_weights: Dict):
         self.lottery_data = lottery_data
-        self.weights = dimension_weights
+        self.weights = dimension_weights  # 各维度乘到分项得分上
         self.sorted_issues = lottery_data['sorted_issues'] if lottery_data else []
-        self.number_stats = {}
-        self.pattern_cache = {}
+        self.number_stats = {}  # 号码 → 出现次数、遗漏、近10期次数等
+        self.pattern_cache = {}  # 热区、热尾、斜连趋势等
         
         if lottery_data:
-            self._precompute_statistics()
-            self._discover_patterns()
+            self._precompute_statistics()  # 先算统计量
+            self._discover_patterns()  # 再算形态特征
     
     def _precompute_statistics(self):
         """预计算统计数据"""
@@ -298,20 +301,20 @@ class MultiDimensionAnalyzer:
         
         total_periods = len(self.sorted_issues)
         
-        occurrence_count = [0] * 80
-        current_absence = [0] * 80
-        absence_history = [[] for _ in range(80)]
+        occurrence_count = [0] * 80  # 下标 0 对应号码 1
+        current_absence = [0] * 80  # 当前遗漏（距最近一次开出的间隔期数）
+        absence_history = [[] for _ in range(80)]  # 历史上相邻两次开出之间的间隔序列
         
         for draw in self.lottery_data['historical_draws'].values():
             for num in draw['numbers']:
                 if 1 <= num <= 80:
-                    occurrence_count[num - 1] += 1
+                    occurrence_count[num - 1] += 1  # 全历史出现次数
         
-        for j in range(80):
+        for j in range(80):  # 算每个号「当前遗漏」：从最近一期往前扫
             num = j + 1
-            current_absence[j] = total_periods
+            current_absence[j] = total_periods  # 默认若从未开出
             
-            for idx in range(total_periods - 1, -1, -1):
+            for idx in range(total_periods - 1, -1, -1):  # 从新到旧
                 issue = self.sorted_issues[idx]
                 numbers = self.lottery_data['historical_draws'][issue]['numbers']
                 if num in numbers:
@@ -611,17 +614,17 @@ class MultiDimensionAnalyzer:
 # ==================== 第四部分：智能预测器 ====================
 
 class IntelligentPredictor:
-    """智能预测器"""
+    """智能预测器：某期只从「五类推荐合并池」里按多维得分取前 count 个（顺序为分数降序，非号序）"""
     
     def __init__(self, dimension_weights: Dict):
         self.weights = dimension_weights
-        self.analyzer = None
+        self.analyzer = None  # 等 set_lottery_data 后再实例化分析器
     
     def set_lottery_data(self, lottery_data: Dict):
-        self.analyzer = MultiDimensionAnalyzer(lottery_data, self.weights)
+        self.analyzer = MultiDimensionAnalyzer(lottery_data, self.weights)  # 绑定历史开奖
     
     def predict_for_period(self, period_data: Dict, count=10) -> List[int]:
-        """预测单期号码"""
+        """预测单期号码：返回长度为 count 的列表（最高分在前）"""
         # 构建推荐号池
         recommend_pool = set()
         recommend_pool.update(period_data.get('kaiji', []))
@@ -643,9 +646,9 @@ class IntelligentPredictor:
             score = self.analyzer.analyze_number(num)
             scores[num] = score
         
-        # 按评分排序，选择前 count 个
+        # 按评分排序，选择前 count 个（item[0] 是号码，item[1] 是得分）
         sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        predicted = [item[0] for item in sorted_scores[:count]]
+        predicted = [item[0] for item in sorted_scores[:count]]  # 展示/邮件里若要号序需再 sorted()
         
         # 输出高分号码详情
         print(f"  TOP5 高分号码:")
@@ -972,7 +975,8 @@ def generate_email_content(prediction_result: Dict, backtest_stats: Dict,
                           all_predictions: Dict[str, List[int]],
                           periodicity_info: Dict) -> str:
     """生成完整邮件 HTML（参考 kl8_zh1.py 格式优化版）"""
-    
+    # ---------- 下面整段是 f-string：内含 HTML + CSS，勿在字符串里写 # 注释 ----------
+    # 结构：head 里 style 定义邮件里各区块样式；body 里 header → 本期10球(见后续循环) → 回测 → 15期卡片
     html_content = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1346,14 +1350,15 @@ def generate_email_content(prediction_result: Dict, backtest_stats: Dict,
                 <div class="section-title">🎯 最新一期智能预测（10 个）</div>
                 <div class="prediction-numbers">
 """
-    
-    predicted_numbers = prediction_result.get('predicted_numbers', [])
-    dan_codes = prediction_result.get('dan_codes', [])
+    # f-string 第一段到此结束：下面用循环补 10 个预测球，再接第二段 HTML
+    predicted_numbers = prediction_result.get('predicted_numbers', [])  # 最新期10个（分数降序）
+    dan_codes = prediction_result.get('dan_codes', [])  # 胆码，用于 CSS 类 dan
     
     for num in predicted_numbers:
-        is_dan = "dan" if num in dan_codes else ""
+        is_dan = "dan" if num in dan_codes else ""  # 在胆码里则多一个 CSS 类名
         html_content += f'                    <div class="number-ball {is_dan}">{num:02d}</div>\n'
     
+    # 第二段 f-string：胆码说明、回测统计区、15 期卡片容器开头
     html_content += f"""
                 </div>
                 <div style="text-align: center; margin-top: 10px; color: #666; font-size: 13px;">
@@ -1378,11 +1383,11 @@ def generate_email_content(prediction_result: Dict, backtest_stats: Dict,
                 <div class="periods-container">
 """
     
-    for period_idx, period_data in enumerate(all_periods_data[:15]):
-        recommend_stats = calculate_recommend_stats(period_data)
-        stats = calculate_hit_statistics(period_data)
+    for period_idx, period_data in enumerate(all_periods_data[:15]):  # 最多 15 张卡片
+        recommend_stats = calculate_recommend_stats(period_data)  # 推荐池、高频列表
+        stats = calculate_hit_statistics(period_data)  # 若未开奖则为 None
         
-        has_lottery = len(period_data.get('lottery_numbers', [])) > 0
+        has_lottery = len(period_data.get('lottery_numbers', [])) > 0  # 是否已有开奖号
         grid = generate_period_grid(period_data)
         grid_html = generate_grid_html(grid, has_lottery)
         
@@ -1399,12 +1404,12 @@ def generate_email_content(prediction_result: Dict, backtest_stats: Dict,
         period_issue = period_data.get('issue', '')
         period_prediction = all_predictions.get(period_issue, [])
         
-        prediction_hits = 0
+        prediction_hits = 0  # 该期预测10个与真实开奖交集个数
         if period_prediction and period_data.get('lottery_numbers'):
             actual = set(period_data['lottery_numbers'])
-            prediction_hits = len(set(period_prediction) & actual)
+            prediction_hits = len(set(period_prediction) & actual)  # 集合交，与顺序无关
         
-        status_text = "待开奖" if not has_lottery else f"已开奖"
+        status_text = "待开奖" if not has_lottery else f"已开奖"  # 卡片标题旁状态
         
         html_content += f"""
             <div class="period-card">
@@ -1552,7 +1557,7 @@ def send_email(html_content: str, subject: str):
 
 # ==================== 第七部分：主程序 ====================
 def process_and_send_email():
-    """处理数据并发送邮件"""
+    """主业务：拉数→分析→预测→写 HTML/JSON→发邮件；供定时任务与手动运行共用"""
     print("\n" + "=" * 80)
     print("快乐 8 智能预测系统 - 执行预测任务")
     print("=" * 80)
@@ -1609,15 +1614,19 @@ def process_and_send_email():
     for period_data in all_periods_data[:15]:
         period_issue = period_data.get('issue', '')
         predicted = predictor.predict_for_period(period_data, count=10)
-        all_predictions[period_issue] = predicted
-        print(f"  第{period_issue}期：预测{len(predicted)}个号码")
+        # 对外统一用号码升序；命中计算等为集合运算，与顺序无关
+        all_predictions[period_issue] = sorted(predicted) if predicted else []
+        print(f"  第{period_issue}期：预测{len(all_predictions[period_issue])}个号码")
 
     # 5. 预测最新一期
     print("\n【步骤 5: 预测最新一期】")
-    latest_period = all_periods_data[0]
+    latest_period = all_periods_data[0]  # HTML 推荐列表已按新→旧排序，故 [0] 为最新一期
 
-    predicted_numbers = predictor.predict_for_period(latest_period, count=10)
-    dan_codes = predicted_numbers[:2] if len(predicted_numbers) >= 2 else predicted_numbers
+    predicted_numbers = predictor.predict_for_period(latest_period, count=10)  # 分数降序；先定胆码再排序
+    dan_codes = predicted_numbers[:2] if len(predicted_numbers) >= 2 else list(predicted_numbers)
+    predicted_numbers = sorted(predicted_numbers)  # 邮件/JSON/打印均用号码升序
+    dan_codes = sorted(dan_codes)  # 仍为分数最高的两枚，仅显示顺序按号序
+    all_predictions[latest_period.get('issue', '')] = predicted_numbers  # 与步骤4可能重复算一期，此处以本次为准
 
     print(f"\n【预测结果】")
     print(f"期号：第 {latest_period.get('issue', '待更新')} 期")
@@ -1689,7 +1698,7 @@ def process_and_send_email():
 
 
 def run_scheduler():
-    """运行定时任务"""
+    """注册每天 17:30 任务并立即跑一轮，然后永不退出地 sleep+检查 schedule"""
     print("\n" + "=" * 80)
     print("快乐 8 智能预测定时任务已启动")
     print("每天 17:30 自动发送预测邮件")
@@ -1709,8 +1718,8 @@ def run_scheduler():
     process_and_send_email()
 
     # 循环检查定时任务
-    while True:
-        schedule.run_pending()
+    while True:  # 常驻：每分钟醒来检查是否到点执行已注册任务
+        schedule.run_pending()  # 执行所有已到期的任务
         time.sleep(60)
 
 
@@ -1727,8 +1736,7 @@ def main():
         import traceback
         traceback.print_exc()
         sys.exit(1)
-# 提交试验
-if __name__ == '__main__':
+if __name__ == '__main__':  # 直接运行本脚本时进入定时模式（非被 import 时）
     main()
 
    
