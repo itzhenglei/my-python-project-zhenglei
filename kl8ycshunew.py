@@ -14,20 +14,26 @@
 7. 邮件格式：完全参考 kl8_zh1.py 的详细展示
 8. 定时任务：每天 17:30 自动发送邮件
 
+扩展说明：
+- 与仓库内分层包 `kl8_prediction/`、`run_kl8.py` **业务逻辑等价**，便于单文件运行或对照阅读。
+- predict_for_period 返回**按分数降序**；对外邮件/JSON 号序见 process_and_send_email 中「方案 A」（先胆码再 sorted）。
+- `generate_email_content` 内大段 HTML/CSS 为 f-string：**勿在字符串内写 Python 的 `#` 注释**，否则会截断或污染邮件。
+
 作者：基于您所有代码的终极整合
 日期：2026-03-19
 """
-# 程序总流程（向下翻看即可）：抓取推荐页+开奖API → 分析“用多少期回测最稳” → 多套权重回测选最优
-# → 对最近15期+最新期做预测 → 拼 HTML 邮件并发信/落盘。定时入口 main() → run_scheduler() 常驻轮询。
+# 程序总流程：抓取推荐页 + 开奖 API → 周期性分析得 optimal_periods → 多组权重回测得 optimal_weights
+# → 最近 15 期每期的 10 码预测 + 最新一期（胆码+升序）→ 拼 HTML、写本地、发邮件、成功则写 JSON。
+# 定时入口：main() → run_scheduler() 注册 17:30 并立即执行一轮，此后每分钟 schedule.run_pending()。
 
 import requests  # HTTP 请求：拉网页、拉 JSON 接口
 from bs4 import BeautifulSoup  # 把 HTML 解析成可查询的标签树
 import re  # 正则：从 HTML 片段里抠开奖号码、匹配 data-name
 import json  # 解析 API 返回的 JSON 文本
-from collections import Counter, defaultdict  # Counter 统计号码出现次数；defaultdict 备用
+from collections import Counter, defaultdict  # Counter：推荐源计数等；defaultdict 当前未用，保留与旧版一致
 from datetime import datetime  # 邮件标题、生成时间、JSON 里的时间戳
 from typing import Dict, List, Tuple, Set  # 类型注解，方便读代码与工具检查
-import random  # 若需随机性（主流程以确定性分析为主）
+import random  # 预留：当前主流程全确定逻辑，未调用 random
 import zmail  # SMTP 发邮件（HTML）
 import schedule  # 按日历时间注册后台任务
 import time  # sleep：定时循环里每隔一段时间检查是否到点
@@ -60,28 +66,29 @@ EMAIL_CONFIG = {  # 发件箱与收件人（password 一般为邮箱 SMTP 授权
     ]
 }
 
-# 基础维度权重：各分析项在「给号码打分」时的相对重要性（后续回测会在此基础上微调）
+# 多维度分析基线权重（数值越大该维在 analyze_number 里影响越大）；BacktestOptimizer 会生成变体并择优
 BASE_DIMENSIONS = {
-    'hot_number': 30,
-    'cold_number': 12,
-    'omission': 18,
-    'diagonal': 10,
-    'consecutive': 8,
-    'repeat': 10,
-    'sum_trend': 5,
-    'odd_even': 4,
-    'big_small': 3,
-    'zone_hot': 8,
-    'tail_pattern': 6,
-    'head_focus': 5,
-    'modulo_3': 5,
+    'hot_number': 30,    # 近 10 期出现偏多的热号
+    'cold_number': 12,   # 长期遗漏后的冷号回补
+    'omission': 18,      # 当前遗漏相对历史均值的偏离
+    'diagonal': 10,      # 三连期斜连（±1 递进）形态
+    'consecutive': 8,    # 与上期连号关系
+    'repeat': 10,        # 与上期重号倾向
+    'sum_trend': 5,      # 近 10 期和值趋势下的大小号倾斜
+    'odd_even': 4,       # 奇偶比趋势
+    'big_small': 3,      # 大小号（>40）占比趋势
+    'zone_hot': 8,       # 四区（每区 20 码）冷热
+    'tail_pattern': 6,   # 个位热尾
+    'head_focus': 5,     # 十位热头
+    'modulo_3': 5,       # 012 路（模 3）偏好
 }
 
 
 # ==================== 第一部分：数据获取 ====================
+# HTML 侧：多期推荐 + 已开奖 20 码；API 侧：更多期开奖与 zhfb 扩展字段。二者由主流程合并使用。
 
 class DataFetcher:
-    """数据获取器：负责 HTTP 拉取 + 解析成 Python 数据结构"""
+    """HTTP 拉取 17500 页面与 JSON，并解析为 dict / list 结构（无业务评分逻辑）。"""
     
     def __init__(self):
         pass  # 无状态，可不初始化成员
@@ -175,7 +182,14 @@ class DataFetcher:
             return []
     
     def parse_api_data(self, api_data):
-        """把开奖 API 的每条记录转成 historical_draws[期号]，并排序期号列表"""
+        """
+        将 API 顶层 JSON 规范为按期号索引的字典。
+
+        返回 lottery_data:
+            current_draw — 遍历中见到的最大期号；
+            historical_draws — 期号(str) -> {numbers, date, sum, span, ...}；
+            sorted_issues — 有开奖数据的期号升序列表（供 MultiDimensionAnalyzer 按时间扫）。
+        """
         lottery_data = {
             'current_draw': '',  # 目前已见的最大期号（字符串）
             'historical_draws': {},  # 期号 → {numbers, date, sum, ...}
@@ -216,16 +230,20 @@ class DataFetcher:
 
 
 # ==================== 第二部分：周期性分析器 ====================
+# 用「相邻两期开奖号的交集个数」在多段历史上滑动；波动小（stability 高）的窗口长度更适合做回测。
 
 class PeriodicityAnalyzer:
-    """周期性分析器：用「相邻期号码重复个数」的波动，选出回测窗口长度（几期更稳）"""
+    """从 lottery_data['sorted_issues'] 时间序列上估计 optimal_periods。"""
     
     def __init__(self, lottery_data: Dict):
-        self.lottery_data = lottery_data  # 含 historical_draws、sorted_issues
-        self.sorted_issues = lottery_data['sorted_issues'] if lottery_data else []  # 升序期号
+        self.lottery_data = lottery_data
+        self.sorted_issues = lottery_data['sorted_issues'] if lottery_data else []  # 时间升序
     
     def analyze_optimal_backtest_periods(self) -> Dict:
-        """枚举多种回测长度，算稳定性 stability，返回最优期数 optimal_periods"""
+        """
+        对 test_ranges 中每个候选期数计算 stability，取最大者作为 optimal_periods。
+        若某长度数据不足则跳过；results 为空时 max() 会异常（与历史行为一致）。
+        """
         print("\n" + "=" * 80)
         print("【开始分析开奖数据周期性】")
         print("=" * 80)
@@ -263,7 +281,7 @@ class PeriodicityAnalyzer:
                     'stability': stability
                 }
         
-        best_period = max(results.items(), key=lambda x: x[1]['stability'])  # 挑 stability 最大的窗口长度
+        best_period = max(results.items(), key=lambda x: x[1]['stability'])
         
         print(f"\n各期数范围稳定性分析:")
         for period, stats in sorted(results.items()):
@@ -279,23 +297,24 @@ class PeriodicityAnalyzer:
 
 
 # ==================== 第三部分：多维度分析引擎 ====================
+# 步骤：_precompute_statistics（全历史+遗漏+近10期计数）→ _discover_patterns（形态缓存）→ analyze_number 加权求和。
 
 class MultiDimensionAnalyzer:
-    """多维度分析器：为 1～80 每个号预计算冷热遗漏等，再按权重合成「综合分」"""
+    """对 1～80 每个号码输出 analyze_number 浮点得分，仅供推荐池内排序使用。"""
     
     def __init__(self, lottery_data: Dict, dimension_weights: Dict):
         self.lottery_data = lottery_data
-        self.weights = dimension_weights  # 各维度乘到分项得分上
+        self.weights = dimension_weights  # 键同 BASE_DIMENSIONS，可被回测最优解覆盖
         self.sorted_issues = lottery_data['sorted_issues'] if lottery_data else []
-        self.number_stats = {}  # 号码 → 出现次数、遗漏、近10期次数等
-        self.pattern_cache = {}  # 热区、热尾、斜连趋势等
+        self.number_stats = {}   # num -> total_count, current_absence, average_absence, max_absence, recent_10_count
+        self.pattern_cache = {}  # 近 10 期衍生的热区/热尾/斜连集等
         
         if lottery_data:
-            self._precompute_statistics()  # 先算统计量
-            self._discover_patterns()  # 再算形态特征
+            self._precompute_statistics()
+            self._discover_patterns()
     
     def _precompute_statistics(self):
-        """预计算统计数据"""
+        """按时间顺序扫描 sorted_issues，填满 number_stats（冷热与遗漏基准）。"""
         if not self.lottery_data:
             return
         
@@ -367,7 +386,7 @@ class MultiDimensionAnalyzer:
             self.number_stats[num]['recent_10_count'] = recent_counts.get(num, 0)
     
     def _discover_patterns(self):
-        """自动发现出号规律"""
+        """仅基于近 10 期汇总形态，写入 pattern_cache 供 analyze_number 查询。"""
         self.pattern_cache = {
             'hot_zones': self._find_hot_zones(),
             'hot_tails': self._find_hot_tails(),
@@ -377,6 +396,7 @@ class MultiDimensionAnalyzer:
         }
     
     def _find_hot_zones(self) -> List[int]:
+        """四小区近 10 期出号合计最多的区编号（返回如 [3]）。"""
         zones = [(1, 20), (21, 40), (41, 60), (61, 80)]
         zone_counts = [0, 0, 0, 0]
         
@@ -392,6 +412,7 @@ class MultiDimensionAnalyzer:
         return [hot_zone_idx + 1]
     
     def _find_hot_tails(self) -> List[int]:
+        """个位 0–9 出现次数 Top3 的尾数。"""
         tail_counts = Counter()
         
         recent_issues = self.sorted_issues[-10:]
@@ -404,6 +425,7 @@ class MultiDimensionAnalyzer:
         return [tail for tail, count in tail_counts.most_common(3)]
     
     def _find_hot_heads(self) -> List[int]:
+        """十位（num//10）出现最多的前 2 个头。"""
         head_counts = Counter()
         
         recent_issues = self.sorted_issues[-10:]
@@ -416,6 +438,7 @@ class MultiDimensionAnalyzer:
         return [head for head, count in head_counts.most_common(2)]
     
     def _find_modulo_trend(self) -> int:
+        """近 10 期 012 路累计出号最多的那一路（0/1/2）。"""
         modulo_counts = {0: 0, 1: 0, 2: 0}
         
         recent_issues = self.sorted_issues[-10:]
@@ -428,6 +451,7 @@ class MultiDimensionAnalyzer:
         return max(modulo_counts.items(), key=lambda x: x[1])[0]
     
     def _find_diagonal_sequences(self) -> Set[int]:
+        """连续三期若形成 n、n±1、n±2 的链，则把端点号加入集合（斜连加分用）。"""
         diagonals = set()
         
         if len(self.sorted_issues) < 3:
@@ -447,6 +471,7 @@ class MultiDimensionAnalyzer:
         return diagonals
     
     def get_latest_numbers(self, n=1):
+        """倒数第 n 期的开奖 20 码（n=1 为最近一期）；用于重号/连号判断。"""
         if not self.lottery_data or n > len(self.sorted_issues):
             return []
         
@@ -454,7 +479,7 @@ class MultiDimensionAnalyzer:
         return self.lottery_data['historical_draws'][issue]['numbers']
     
     def analyze_number(self, num: int) -> float:
-        """分析单个号码的综合评分"""
+        """对单号累加热冷、遗漏、形态等 weighted 分项；无统计时返回 0.0。"""
         if num not in self.number_stats:
             return 0.0
         
@@ -550,6 +575,7 @@ class MultiDimensionAnalyzer:
         return score
     
     def _check_consecutive_pattern(self, num: int) -> float:
+        """与最近一期比邻或双侧夹紧时加分，封顶 2.0。"""
         bonus = 0.0
         
         latest_nums = set(self.get_latest_numbers(1))
@@ -563,6 +589,7 @@ class MultiDimensionAnalyzer:
         return min(bonus, 2.0)
     
     def _calculate_repeat_probability(self) -> float:
+        """近若干对相邻期的 |上期∩当期| 平均值，作 repeat 维度尺度；数据不足时回退 5.0。"""
         if len(self.sorted_issues) < 2:
             return 5.0
         
@@ -575,6 +602,7 @@ class MultiDimensionAnalyzer:
         return sum(repeat_counts) / len(repeat_counts) if repeat_counts else 5.0
     
     def _analyze_sum_trend(self) -> Dict:
+        """近 10 期每期 20 码和值：均值与首尾粗趋势 up/down。"""
         recent_sums = []
         for issue in self.sorted_issues[-10:]:
             draw = self.lottery_data['historical_draws'][issue]
@@ -586,6 +614,7 @@ class MultiDimensionAnalyzer:
         }
     
     def _analyze_odd_even_trend(self) -> Dict:
+        """近 10 期奇数个数的均值，并给出 target_odd 供奇偶加分。"""
         odd_counts = []
         for issue in self.sorted_issues[-10:]:
             draw = self.lottery_data['historical_draws'][issue]
@@ -600,6 +629,7 @@ class MultiDimensionAnalyzer:
         }
     
     def _analyze_big_small_trend(self) -> str:
+        """近 10 期大号（>40）个数均值，返回「大数多/小数多/平衡」。"""
         big_counts = []
         for issue in self.sorted_issues[-10:]:
             draw = self.lottery_data['historical_draws'][issue]
@@ -612,19 +642,24 @@ class MultiDimensionAnalyzer:
 
 
 # ==================== 第四部分：智能预测器 ====================
+# 候选池 = 五类推荐的并集；池外号码不参与打分。返回列表为分数降序，与最终展示升序不同。
 
 class IntelligentPredictor:
-    """智能预测器：某期只从「五类推荐合并池」里按多维得分取前 count 个（顺序为分数降序，非号序）"""
+    """包装 MultiDimensionAnalyzer + 当期 period_data，输出 Top count 号码列表。"""
     
     def __init__(self, dimension_weights: Dict):
         self.weights = dimension_weights
-        self.analyzer = None  # 等 set_lottery_data 后再实例化分析器
+        self.analyzer = None  # 须先 set_lottery_data
     
     def set_lottery_data(self, lottery_data: Dict):
-        self.analyzer = MultiDimensionAnalyzer(lottery_data, self.weights)  # 绑定历史开奖
+        """绑定 parse_api_data 结果，构造分析器并预计算全历史统计。"""
+        self.analyzer = MultiDimensionAnalyzer(lottery_data, self.weights)
     
     def predict_for_period(self, period_data: Dict, count=10) -> List[int]:
-        """预测单期号码：返回长度为 count 的列表（最高分在前）"""
+        """
+        在推荐并集上 analyze_number，取分数最高的 count 个。
+        返回顺序为**得分从高到低**；主流程会对邮件/JSON 再做 sorted（方案 A）。
+        """
         # 构建推荐号池
         recommend_pool = set()
         recommend_pool.update(period_data.get('kaiji', []))
@@ -659,9 +694,10 @@ class IntelligentPredictor:
 
 
 # ==================== 第五部分：回测优化器 ====================
+# 在已开奖期上枚举多组权重，用 predict_for_period 的 10 码与真实开奖求交，选命中率最高的权重。
 
 class BacktestOptimizer:
-    """回测优化器"""
+    """网格搜索若干权重配置；返回最优 weights 及统计命中率（供邮件与 JSON）。"""
     
     def __init__(self):
         self.base_weights = BASE_DIMENSIONS.copy()
@@ -669,7 +705,10 @@ class BacktestOptimizer:
     def optimize_weights_by_reverse_engineering(self, all_periods_data: List[Dict], 
                                                    lottery_data: Dict, 
                                                    optimal_periods: int) -> Tuple[Dict, Dict]:
-        """反推优化法"""
+        """
+        先统计高频/低频推荐命中（打印用），再 _test_weight_configs 选最优权重。
+        返回 (optimal_weights, {hit_rate, high_freq_hit_rate, low_freq_hit_rate})。
+        """
         print("\n" + "=" * 80)
         print("【开始反推优化权重配置】")
         print("=" * 80)
@@ -748,7 +787,7 @@ class BacktestOptimizer:
     
     def _test_weight_configs(self, all_periods_data: List[Dict], lottery_data: Dict, 
                             optimal_periods: int) -> Dict:
-        """测试多种权重配置"""
+        """对 configs 中每组权重跑回测，返回 hit_rate 最大的一组（含 weights）。"""
         configs = []
         
         configs.append({'name': '基础配置', 'weights': self.base_weights.copy()})
@@ -787,6 +826,7 @@ class BacktestOptimizer:
             total_hits = 0
             total_predictions = 0
             
+            # 时间从旧到新遍历（与历史实现一致）
             reversed_periods = list(reversed(all_periods_data[:optimal_periods]))
             
             for period_data in reversed_periods:
@@ -816,9 +856,13 @@ class BacktestOptimizer:
 
 
 # ==================== 第六部分：邮件生成（参考 kl8_zh1.py） ====================
+# 纯展示逻辑：不参与选号。generate_email_content 内大块 f-string 禁止写 Python # 注释。
 
 def calculate_recommend_stats(period_data: Dict) -> Dict:
-    """计算推荐号统计信息"""
+    """
+    五类推荐去重池大小、≥2 源重复的「高频」号码列表及个数。
+    返回 dict: total_recommends, high_freq_numbers, high_freq_count。
+    """
     # 合并所有推荐号
     all_kaiji = period_data.get('kaiji', [])
     all_shiji = period_data.get('shiji', [])
@@ -856,7 +900,7 @@ def calculate_recommend_stats(period_data: Dict) -> Dict:
 
 
 def generate_period_grid(period_data: Dict) -> List[List[Dict]]:
-    """生成单期 9 宫格数据"""
+    """8×10 共 80 格：每格 number + 是否开奖/推荐/命中 + type_labels（开试金关对）。"""
     grid = []
     
     lottery_numbers = set(period_data.get('lottery_numbers', []))
@@ -909,7 +953,10 @@ def generate_period_grid(period_data: Dict) -> List[List[Dict]]:
 
 
 def calculate_hit_statistics(period_data: Dict) -> Dict:
-    """计算命中统计"""
+    """
+    已开奖时：推荐全集与开奖 20 码交集、分项命中、hit_rate = total_hits/20*100。
+    未开奖返回 None。
+    """
     lottery_numbers = set(period_data.get('lottery_numbers', []))
     kaiji = set(period_data.get('kaiji', []))
     shiji = set(period_data.get('shiji', []))
@@ -937,7 +984,7 @@ def calculate_hit_statistics(period_data: Dict) -> Dict:
 
 
 def generate_grid_html(grid: List[List[Dict]], has_lottery: bool = True) -> str:
-    """生成 9 宫格 HTML"""
+    """把 generate_period_grid 的结果渲染为邮件内联 div 网格（CSS 类 hit/lottery/recommend 等）。"""
     grid_html = ""
     
     for row_idx, row in enumerate(grid):
@@ -974,9 +1021,12 @@ def generate_email_content(prediction_result: Dict, backtest_stats: Dict,
                           all_periods_data: List[Dict], optimal_weights: Dict,
                           all_predictions: Dict[str, List[int]],
                           periodicity_info: Dict) -> str:
-    """生成完整邮件 HTML（参考 kl8_zh1.py 格式优化版）"""
-    # ---------- 下面整段是 f-string：内含 HTML + CSS，勿在字符串里写 # 注释 ----------
-    # 结构：head 里 style 定义邮件里各区块样式；body 里 header → 本期10球(见后续循环) → 回测 → 15期卡片
+    """
+    拼装整页 HTML。optimal_weights 当前模板未大段展示，保留参数兼容调用方。
+    流程：首段 f-string → for 拼 10 球 → 第二段 f-string → 15 期循环拼卡片 → 收尾 f-string。
+    """
+    # 下列三重引号 f-string 内含大量 CSS/HTML：仅允许在「本文件此处」用 # 说明；勿在字符串内写 # 
+    # 首段：DOCTYPE ～ 预测号码容器开口；10 个球在下方 Python for 中追加
     html_content = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1350,15 +1400,15 @@ def generate_email_content(prediction_result: Dict, backtest_stats: Dict,
                 <div class="section-title">🎯 最新一期智能预测（10 个）</div>
                 <div class="prediction-numbers">
 """
-    # f-string 第一段到此结束：下面用循环补 10 个预测球，再接第二段 HTML
-    predicted_numbers = prediction_result.get('predicted_numbers', [])  # 最新期10个（分数降序）
-    dan_codes = prediction_result.get('dan_codes', [])  # 胆码，用于 CSS 类 dan
+    # 此时 prediction_result 已在主流程按方案 A 处理：号码升序；dan 为分数最高的两枚（显示序已 sort）
+    predicted_numbers = prediction_result.get('predicted_numbers', [])
+    dan_codes = prediction_result.get('dan_codes', [])
     
     for num in predicted_numbers:
-        is_dan = "dan" if num in dan_codes else ""  # 在胆码里则多一个 CSS 类名
+        is_dan = "dan" if num in dan_codes else ""
         html_content += f'                    <div class="number-ball {is_dan}">{num:02d}</div>\n'
     
-    # 第二段 f-string：胆码说明、回测统计区、15 期卡片容器开头
+    # 第二段 f-string：胆码图例、回测数字、外层「15 期」容器开头（单张卡片仍在下面 Python 循环里拼）
     html_content += f"""
                 </div>
                 <div style="text-align: center; margin-top: 10px; color: #666; font-size: 13px;">
@@ -1383,11 +1433,12 @@ def generate_email_content(prediction_result: Dict, backtest_stats: Dict,
                 <div class="periods-container">
 """
     
-    for period_idx, period_data in enumerate(all_periods_data[:15]):  # 最多 15 张卡片
-        recommend_stats = calculate_recommend_stats(period_data)  # 推荐池、高频列表
-        stats = calculate_hit_statistics(period_data)  # 若未开奖则为 None
+    # 每期一张 period-card：宫格 →（已开奖）统计表 →（有）高频区 →（有）预测 10 码对比 → 图例
+    for period_idx, period_data in enumerate(all_periods_data[:15]):
+        recommend_stats = calculate_recommend_stats(period_data)
+        stats = calculate_hit_statistics(period_data)
         
-        has_lottery = len(period_data.get('lottery_numbers', [])) > 0  # 是否已有开奖号
+        has_lottery = len(period_data.get('lottery_numbers', [])) > 0
         grid = generate_period_grid(period_data)
         grid_html = generate_grid_html(grid, has_lottery)
         
@@ -1404,12 +1455,12 @@ def generate_email_content(prediction_result: Dict, backtest_stats: Dict,
         period_issue = period_data.get('issue', '')
         period_prediction = all_predictions.get(period_issue, [])
         
-        prediction_hits = 0  # 该期预测10个与真实开奖交集个数
+        prediction_hits = 0
         if period_prediction and period_data.get('lottery_numbers'):
             actual = set(period_data['lottery_numbers'])
-            prediction_hits = len(set(period_prediction) & actual)  # 集合交，与顺序无关
+            prediction_hits = len(set(period_prediction) & actual)
         
-        status_text = "待开奖" if not has_lottery else f"已开奖"  # 卡片标题旁状态
+        status_text = "待开奖" if not has_lottery else f"已开奖"
         
         html_content += f"""
             <div class="period-card">
@@ -1426,6 +1477,7 @@ def generate_email_content(prediction_result: Dict, backtest_stats: Dict,
 """
         
         if stats and has_lottery:
+            # 命中率阈值着色：≥30% good，≥50% excellent
             hit_class = "good" if stats['hit_rate'] >= 30 else ""
             hit_class = "excellent" if stats['hit_rate'] >= 50 else hit_class
             
@@ -1467,6 +1519,7 @@ def generate_email_content(prediction_result: Dict, backtest_stats: Dict,
 """
         
         if high_freq_numbers:
+            # 嵌套 f-string 拼标题；内部仍是 HTML，不要写 Python #
             high_freq_html = f"""
                 <div class="high-freq-section">
                     <div class="high-freq-title">🔥 高频推荐（出现≥2 次）共{high_freq_count}个 
@@ -1485,6 +1538,7 @@ def generate_email_content(prediction_result: Dict, backtest_stats: Dict,
             html_content += high_freq_html
         
         if period_prediction:
+            # 与 all_predictions 中期号对应；已开奖则标题可带命中个数
             prediction_html = f"""
                 <div class="prediction-info">
                     <div class="prediction-title">🔮 预测号码（10 个）{f'(命中{prediction_hits}个)' if has_lottery and prediction_hits > 0 else ''}</div>
@@ -1531,11 +1585,15 @@ def generate_email_content(prediction_result: Dict, backtest_stats: Dict,
 </body>
 </html>"""
     
-    return html_content
+    return html_content  # 完整 HTML 文档字符串
 
 
 def send_email(html_content: str, subject: str):
-    """发送邮件"""
+    """
+    使用 EMAIL_CONFIG 登录 SMTP，向 recipients 逐人发送 HTML 邮件。
+
+    返回 True 表示全部收件人 send 未抛错；False 时主流程不写 JSON。
+    """
     try:
         mail_data = {
             'subject': subject,
@@ -1556,13 +1614,19 @@ def send_email(html_content: str, subject: str):
 
 
 # ==================== 第七部分：主程序 ====================
+# 落盘：带时间戳的 .html 始终写入；kl8_intelligent_prediction.json 仅发信成功后写入。
+
+
 def process_and_send_email():
-    """主业务：拉数→分析→预测→写 HTML/JSON→发邮件；供定时任务与手动运行共用"""
+    """
+    单次端到端业务。返回 True 当且仅当邮件发送成功（此时 JSON 已更新）。
+
+    步骤编号与控制台「步骤 n」打印一致，便于日志对照。
+    """
     print("\n" + "=" * 80)
     print("快乐 8 智能预测系统 - 执行预测任务")
     print("=" * 80)
 
-    # 1. 获取数据
     print("\n【步骤 1: 获取数据】")
     fetcher = DataFetcher()
 
@@ -1585,13 +1649,11 @@ def process_and_send_email():
     lottery_data = fetcher.parse_api_data(api_data)
     print(f"✓ 成功获取 {len(lottery_data['sorted_issues'])} 期开奖数据")
 
-    # 2. 周期性分析
     print("\n【步骤 2: 分析周期性，确定最优回测期数】")
     periodicity_analyzer = PeriodicityAnalyzer(lottery_data)
     periodicity_result = periodicity_analyzer.analyze_optimal_backtest_periods()
     optimal_periods = periodicity_result['optimal_periods']
 
-    # 3. 反推优化权重
     print("\n【步骤 3: 反推优化权重配置】")
     optimizer = BacktestOptimizer()
 
@@ -1604,7 +1666,6 @@ def process_and_send_email():
         backtest_periods, lottery_data, optimal_periods
     )
 
-    # 4. 对最近 15 期进行预测
     print("\n【步骤 4: 生成最近 15 期预测结果】")
     all_predictions = {}
 
@@ -1618,7 +1679,6 @@ def process_and_send_email():
         all_predictions[period_issue] = sorted(predicted) if predicted else []
         print(f"  第{period_issue}期：预测{len(all_predictions[period_issue])}个号码")
 
-    # 5. 预测最新一期
     print("\n【步骤 5: 预测最新一期】")
     latest_period = all_periods_data[0]  # HTML 推荐列表已按新→旧排序，故 [0] 为最新一期
 
@@ -1633,7 +1693,6 @@ def process_and_send_email():
     print(f"预测号码：{predicted_numbers}")
     print(f"胆码：{dan_codes}")
 
-    # 6. 统计
     backtest_stats = {
         'total_periods': len(backtest_periods),
         'max_hit_rate': backtest_result.get('hit_rate', 0.0),
@@ -1641,7 +1700,6 @@ def process_and_send_email():
         'low_freq_hit_rate': backtest_result.get('low_freq_hit_rate', 0.0)
     }
 
-    # 7. 生成邮件
     print("\n【步骤 6: 发送邮件】")
 
     prediction_result = {
@@ -1660,7 +1718,6 @@ def process_and_send_email():
 
     subject = f'🎲 快乐 8 智能预测 - 第{latest_period.get("issue", "")}期 - {datetime.now().strftime("%Y-%m-%d")}'
 
-    # 8. 保存 HTML 文件
     filename = f'kl8_intelligent_prediction_{datetime.now().strftime("%Y%m%d_%H%M%S")}.html'
     with open(filename, 'w', encoding='utf-8') as f:
         f.write(html_content)
@@ -1669,7 +1726,6 @@ def process_and_send_email():
     if send_email(html_content, subject):
         print("✓ 邮件发送成功")
 
-        # 9. 保存结果
         result = {
             'period': latest_period.get('issue', ''),
             'generated_at': datetime.now().isoformat(),
@@ -1698,13 +1754,15 @@ def process_and_send_email():
 
 
 def run_scheduler():
-    """注册每天 17:30 任务并立即跑一轮，然后永不退出地 sleep+检查 schedule"""
+    """
+    守护进程式定时：注册 schedule 任务后先同步跑一遍 process_and_send_email，
+    再 while True 每分钟 run_pending（到点自动发预测邮件）。
+    """
     print("\n" + "=" * 80)
     print("快乐 8 智能预测定时任务已启动")
     print("每天 17:30 自动发送预测邮件")
     print("=" * 80)
 
-    # 注册定时任务 - 每天 17:30 执行
     schedule.every().day.at("17:30").do(process_and_send_email)
 
     print("\n【定时任务已注册】")
@@ -1713,20 +1771,17 @@ def run_scheduler():
     print("  💾 保存文件：HTML + JSON")
     print("\n按 Ctrl+C 退出程序\n")
 
-    # 立即执行一次
     print("\n执行首次任务...\n")
     process_and_send_email()
 
-    # 循环检查定时任务
-    while True:  # 常驻：每分钟醒来检查是否到点执行已注册任务
-        schedule.run_pending()  # 执行所有已到期的任务
+    while True:
+        schedule.run_pending()
         time.sleep(60)
 
 
 def main():
-    """主程序入口"""
+    """脚本直接运行时入口：进入定时调度；被 import 时不会自动执行。"""
     try:
-        # 启动定时任务
         run_scheduler()
 
     except KeyboardInterrupt:
@@ -1736,7 +1791,9 @@ def main():
         import traceback
         traceback.print_exc()
         sys.exit(1)
-if __name__ == '__main__':  # 直接运行本脚本时进入定时模式（非被 import 时）
+
+
+if __name__ == '__main__':
     main()
 
    
