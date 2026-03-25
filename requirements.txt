@@ -1,0 +1,5 @@
+# kl8ycshunew.py
+requests>=2.28.0
+beautifulsoup4>=4.11.0
+zmail>=0.2.8
+schedule>=1.2.0
