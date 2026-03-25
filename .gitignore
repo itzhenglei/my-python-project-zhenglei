@@ -62,6 +62,7 @@ pytest_cache/
 # Editors / IDE（仅忽略本机常变的 PyCharm 文件，其余 .idea 仍可纳入版本库）
 .idea/misc.xml
 .idea/PyCharmMiscProject.iml
+.idea/vcs.xml
 .vscode/
 *.swp
 *.swo
