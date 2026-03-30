@@ -17,6 +17,7 @@ from datetime import datetime
 import schedule
 
 from kl8_prediction.backtest import BacktestOptimizer
+from kl8_prediction.config import KL8_SQLITE_SYNC
 from kl8_prediction.fetcher import DataFetcher
 from kl8_prediction.mail.content import generate_email_content
 from kl8_prediction.mail.sender import send_email
@@ -113,6 +114,22 @@ def process_and_send_email():
         'high_freq_hit_rate': backtest_result.get('high_freq_hit_rate', 0.0),
         'low_freq_hit_rate': backtest_result.get('low_freq_hit_rate', 0.0)
     }
+
+    # --- 6b. 写入 KL8 SQLite（与 backend/app.py 读库对齐；失败不阻断发信）---
+    if KL8_SQLITE_SYNC:
+        try:
+            from kl8_prediction.store import sync_pipeline_to_sqlite
+
+            sync_pipeline_to_sqlite(
+                all_periods_data=all_periods_data,
+                all_predictions=all_predictions,
+                optimal_weights=optimal_weights,
+                optimal_periods=optimal_periods,
+                backtest_stats=backtest_stats,
+                lottery_data=lottery_data,
+            )
+        except Exception as db_err:
+            print(f"⚠️ 写入 KL8 数据库失败：{db_err}")
 
     # --- 7. 渲染 HTML、写本地、发 SMTP ---
     print("\n【步骤 6: 发送邮件】")

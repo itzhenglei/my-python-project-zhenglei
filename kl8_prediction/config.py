@@ -5,6 +5,16 @@
 - 各业务模块从此处读取常量，避免魔法字符串散落。
 - 邮箱 password 一般为 SMTP 授权码，请勿泄露或提交到公开仓库；需要时可改为 os.environ。
 """
+import os
+
+# --- SQLite 导出（独立工程：不写死对方仓库路径，仅通过环境变量指向同一 db 文件）---
+# 建议导出前设置绝对路径，例如与读库服务使用的文件一致：
+#   export KL8_SQLITE_PATH=/path/to/kl8.db
+# 读库侧若已用 KL8_DATABASE，这里也可沿用同名环境变量。
+SQLITE_EXPORT_PATH = os.environ.get("KL8_SQLITE_PATH") or os.environ.get("KL8_DATABASE")
+
+# 设为 0 则关闭导出（即使已配置路径）。
+KL8_SQLITE_SYNC = os.environ.get("KL8_SQLITE_SYNC", "1") != "0"
 
 # 17500「快乐 8」推荐合一页：含多期开机/试机/金码/关注/对应等（由 fetcher 解析 HTML）
 KL8_HTML_URL = 'https://www.17500.cn/tool/kl8-allm.html'
